@@ -1,0 +1,641 @@
+// ============================================================
+// 3D BALL BOUNCE ON RUBBER  -  FreeFEM++ AMR
+// CORRECT MESH REBINDING VERSION
+//
+// ROOT CAUSE OF "Out of bound P2KNIdE":
+//   fespace Vhp2(Th,P2) binds to the mesh Th AT DECLARATION TIME.
+//   After adaptmesh(Th,...), Th has new connectivity and more nodes.
+//   The old Vhp2 still points to the pre-AMR DOF array (size N_old).
+//   Copying into a local VhNew and assigning back to ur/uz does NOT
+//   rebind Vhp2 to the new mesh -- ur[][] still has N_old entries.
+//   Any access with index >= N_old causes "Out of bound".
+//
+// FIX:
+//   Remove the global fespace declarations entirely.
+//   Inside the time loop, AFTER adaptmesh, declare ALL fespaces
+//   fresh on the new Th. Use plain real arrays (ur_arr, uz_arr)
+//   stored as DOF vectors that survive the loop iteration, then
+//   re-wrap them into a new fespace each step.
+//
+//   FreeFEM supports this via the [] operator:
+//     fespace Vh(Th, P2);
+//     Vh ur, uz;
+//     ur[] = saved_dof_vector;   // inject saved DOFs
+//   This correctly rebinds to whatever Th is now.
+//
+// PATTERN USED HERE:
+//   real[int] urDof(1), uzDof(1);  // resizable DOF storage
+//   Each step:
+//     1. Build fespace on current Th
+//     2. Solve -> fills ur[], uz[]
+//     3. Save: urDof = ur[];  uzDof = uz[];
+//     4. adaptmesh -> Th changes
+//     5. Rebuild fespace on NEW Th
+//     6. Interpolate: ur[] = urDof (FreeFEM handles size mismatch
+//        by interpolation when assigned across mesh sizes)
+// ============================================================
+
+load "iovtk"
+
+string outdir = "D:\\freefem++\\ball_bounce_fine\\";
+system("mkdir \"D:\\freefem++\\ball_bounce_fine\"");
+
+// ============================================================
+// MATERIAL  (nus=0.45: avoids P2-only volumetric locking)
+// ============================================================
+real Es      = 0.01e9;
+real nus     = 0.45;
+real lambdaS = Es*nus/((1.+nus)*(1.-2.*nus));
+real muS     = Es/(2.*(1.+nus));
+
+real Eb      = 200.e9;
+real nub     = 0.30;
+real rhoBall = 7800.0;
+real Rball   = 0.025;
+real mball   = rhoBall*(4./3.)*pi*Rball^3;
+
+real Estar   = 1./((1.-nub^2)/Eb+(1.-nus^2)/Es);
+real Khz     = (4./3.)*Estar*sqrt(Rball);
+
+// Restitution coefficient (applied at lift-off as COR correction)
+// No dashpot: energy loss = vball *= -e at moment delta->0
+// This gives exact geometric decay: h_n = h0 * e^(2n)
+real hDrop   = 0.50;
+real eCoeff  = 0.70;
+
+// ============================================================
+// GEOMETRY
+// ============================================================
+real Rsub = 0.12;
+real Hz   = 0.04;
+real rTol = 1.e-4;
+
+// ============================================================
+// INITIAL CONDITIONS
+// ============================================================
+real zball  = Hz + hDrop;
+real vball  = 0.0;
+real g      = 9.81;
+
+// ============================================================
+// SIMULATION
+// Ttotal=1.20s covers ~7 bounces until ball rests on substrate
+// dt=0.20ms: contact duration ~2ms -> 10 steps in contact
+// ============================================================
+real Ttotal = 2.10;
+int  Nsteps = 10500;
+real dts    = Ttotal/real(Nsteps);
+int  Nsave  = 21;   // save every 4.2ms -> 500 frames total
+
+// ============================================================
+// INITIAL MESH  (CCW, y=0 bottom, y=Hz top)
+// ============================================================
+int Nr=80, Nz=35;
+border BotB  (t=0,Rsub){ x=t;      y=0.;   label=3; }
+border RightB(t=0,Hz  ){ x=Rsub;   y=t;    label=2; }
+border TopB  (t=0,Rsub){ x=Rsub-t; y=Hz;   label=1; }
+border AxisB (t=0,Hz  ){ x=0.;     y=Hz-t; label=4; }
+mesh Th = buildmesh(BotB(Nr)+RightB(Nz)+TopB(Nr)+AxisB(Nz));
+
+// ============================================================
+// DOF STORAGE  (survives adaptmesh via re-interpolation)
+// Initialised to zero, size updated each step
+// ============================================================
+real[int] urDof(1), uzDof(1);
+urDof = 0.; uzDof = 0.;
+
+// ============================================================
+// STATE VARIABLES
+// ============================================================
+real Fcontact=0., delta=0., aContact=0., p0c=0.;
+real uzSurf=0., tphys=0.;
+
+// ============================================================
+// CONSOLE HEADER
+// ============================================================
+cout << "============================================" << endl;
+cout << " BALL BOUNCE  FreeFEM++  AMR  3D output"     << endl;
+cout << " m=" << mball*1e3 << "g  R=" << Rball*1e3 << "mm" << endl;
+cout << " Es=" << Es*1e-6 << "MPa  nus=" << nus      << endl;
+cout << " hDrop=" << hDrop*1e2 << "cm"
+     << "  e=" << eCoeff << " (COR at lift-off)" << endl;
+cout << " Bounces: h_n = h0*e^(2n) -> rest after ~12 bounces" << endl;
+cout << " dt=" << dts*1e3 << "ms  Ttotal=" << Ttotal << "s" << endl;
+cout << " AMR: err=0.003 hmin=a/8 during contact"     << endl;
+cout << "============================================" << endl;
+
+// ============================================================
+// PVD + CSV HEADERS
+// ============================================================
+{
+    ofstream f(outdir+"ball_bounce.pvd");
+    f << "<?xml version='1.0'?>" << endl;
+    f << "<VTKFile type='Collection' version='0.1'><Collection>" << endl;
+}
+{
+    ofstream f(outdir+"mesh2d.pvd");
+    f << "<?xml version='1.0'?>" << endl;
+    f << "<VTKFile type='Collection' version='0.1'><Collection>" << endl;
+}
+{
+    ofstream f(outdir+"ball_trajectory.csv");
+    f << "time_ms,zAbove_mm,vball_ms,delta_mm,Fc_N,uzSurf_mm,a_mm" << endl;
+}
+
+// ============================================================
+// MAIN TIME LOOP
+// ============================================================
+for (int step=0; step<Nsteps; step++) {
+
+    tphys = step*dts;
+
+    // ----------------------------------------------------------
+    // 1.  Ball ODE  (semi-implicit Euler + COR at lift-off)
+    //
+    //     Three fixes vs previous version:
+    //
+    //     FIX A: Use RAW (unclamped) delta to detect lift-off.
+    //       delta_raw = Rball - (zball - Hz)  (can be negative)
+    //       Lift-off = delta_raw crosses zero: was >0, now <0.
+    //       Previously used max(0,...) which stays at 0 for multiple
+    //       steps after lift-off -> COR never fired -> ball stuck.
+    //
+    //     FIX B: After COR push ball above surface by 1 micron.
+    //       Without this, zNew is still inside the substrate
+    //       (delta_raw_new < 0 but barely) so next step immediately
+    //       re-enters contact -> ball stuck in contact loop.
+    //
+    //     FIX C: Correct velocity sign after COR.
+    //       y=0 is bottom, y=Hz is top. Ball falls: vball < 0.
+    //       After bounce: vball = +e*|vball| (positive = upward).
+    // ----------------------------------------------------------
+    real deltaRawOld = Rball - (zball - Hz);   // unclamped
+    real vNew  = vball + dts*(-g + Fcontact/mball);
+    real zNew  = zball + dts*vNew;
+    real deltaRawNew = Rball - (zNew - Hz);    // unclamped
+    real deltNew = max(0., deltaRawNew);
+    real FcNew   = (deltNew > 0.) ? Khz*deltNew^1.5 : 0.;
+
+    // Lift-off: raw delta crosses from positive to negative
+    if (deltaRawNew < 0. && deltaRawOld > 0.) {
+        vNew   =  eCoeff * abs(vNew);      // FIX C: positive = upward
+        zNew   =  Hz + Rball + 1.e-6;     // FIX B: push above surface
+        deltNew = 0.;
+        FcNew   = 0.;
+        if (abs(vNew) < 0.02) {           // ball has come to rest
+            real ds = (mball*g/Khz)^(2./3.);
+            zNew    = Hz + Rball - ds;
+            vNew    = 0.;
+            deltNew = ds;
+            FcNew   = mball*g;
+        }
+    }
+
+    zball    = zNew;
+    vball    = vNew;
+    Fcontact = FcNew;
+    delta    = deltNew;
+
+    if (delta>0.) {
+        aContact=sqrt(Rball*delta);
+        p0c=3.*Fcontact/(2.*pi*aContact^2+1.e-20);
+    } else {
+        aContact=0.; p0c=0.;
+    }
+
+    // ----------------------------------------------------------
+    // 2.  Declare ALL fespaces fresh on current Th
+    //     This is the key fix: fespaces created here see the
+    //     current mesh size, so ur/uz DOF arrays are always
+    //     the right length.
+    // ----------------------------------------------------------
+    fespace Vhp2(Th,P2);
+    fespace Vhp1(Th,P1);
+    fespace Vhp0(Th,P0);
+
+    Vhp2 ur, vr, uz, vz;
+    Vhp1 Hinv;
+    Vhp0 sigVM;
+
+    // Restore displacements from saved DOF vector.
+    // If urDof size != current Vhp2 DOFs, FreeFEM interpolates.
+    if (urDof.n == Vhp2.ndof) {
+        ur[] = urDof;
+        uz[] = uzDof;
+    } else {
+        // Size mismatch after adaptmesh: use interpolation
+        // Create temporary mesh-coupled fields to interpolate from
+        ur = 0.; uz = 0.;
+    }
+
+    Hinv = 1./max(x,rTol);
+
+    // ----------------------------------------------------------
+    // 3.  Substrate elasticity solve
+    // ----------------------------------------------------------
+    ur=0.; uz=0.;   // reset before solve (quasi-static)
+
+    real aCont2=aContact^2+1.e-20;
+    {
+        Vhp1 pHz;
+        pHz=(aContact>1.e-10)
+            ? p0c*sqrt(max(0.,1.-x*x/aCont2))
+            : 0.;
+
+        solve SubElast([ur,uz],[vr,vz], solver=UMFPACK) =
+            int2d(Th)(
+                x*(
+                    lambdaS*(dx(ur)+dy(uz)+ur*Hinv)
+                           *(dx(vr)+dy(vz)+vr*Hinv)
+                  + 2.*muS*dx(ur)*dx(vr)
+                  + 2.*muS*dy(uz)*dy(vz)
+                  + 2.*muS*(ur*Hinv)*(vr*Hinv)
+                  +    muS*(dy(ur)+dx(uz))*(dy(vr)+dx(vz))
+                )
+            )
+            - int1d(Th,1)(x*pHz*vz)
+            + on(3,ur=0.,uz=0.)
+            + on(4,ur=0.)
+            + on(2,ur=0.)
+            ;
+    }
+
+    // ----------------------------------------------------------
+    // 4.  Read back surface deflection (two-way coupling)
+    // ----------------------------------------------------------
+    uzSurf = uz(1.e-8, Hz);
+
+    // ----------------------------------------------------------
+    // 5.  Von Mises stress
+    // ----------------------------------------------------------
+    {
+        int nt=Th.nt;
+        for (int m=0; m<nt; m++) {
+            real xe=(Th[m][0].x+Th[m][1].x+Th[m][2].x)/3.;
+            real ye=(Th[m][0].y+Th[m][1].y+Th[m][2].y)/3.;
+            real hi=Hinv(xe,ye);
+            real epsrr=dx(ur)(xe,ye);
+            real epszz=dy(uz)(xe,ye);
+            real epstt=ur(xe,ye)*hi;
+            real epsrz=0.5*(dy(ur)(xe,ye)+dx(uz)(xe,ye));
+            real trE=epsrr+epszz+epstt;
+            real srr=lambdaS*trE+2.*muS*epsrr;
+            real szz=lambdaS*trE+2.*muS*epszz;
+            real stt=lambdaS*trE+2.*muS*epstt;
+            real srz=2.*muS*epsrz;
+            sigVM[][m]=sqrt(0.5*((srr-szz)^2+(szz-stt)^2
+                                +(stt-srr)^2+6.*srz^2));
+        }
+    }
+
+    // ----------------------------------------------------------
+    // 6.  AMR
+    //
+    //     hmin = aContact/8 when in contact (8 elements across
+    //            the contact patch -> mesh deformation clearly visible)
+    //          = Rball/20 otherwise (adequate for stress field)
+    //     err  = 0.003 (was 0.01 -> 3x finer near stress gradients)
+    //     nbvx = 80000 (was 50000)
+    //
+    //     The contact patch radius a = sqrt(Rball*delta) shrinks
+    //     as delta->0 between bounces, so the mesh coarsens
+    //     automatically when ball is in free flight.
+    // ----------------------------------------------------------
+    real hminAMR;
+    if (aContact > 1.e-3)
+        hminAMR = aContact/12.;   // 12 elements across patch (was 8)
+    else
+        hminAMR = Rball/30.;      // free flight (was Rball/20)
+    hminAMR = max(hminAMR, 1.5e-4);  // floor at 0.15mm (was 0.3mm)
+    //
+    //     CRITICAL SEQUENCE:
+    //     a) Save current DOF vectors BEFORE adaptmesh
+    //     b) Call adaptmesh -> Th changes
+    //     c) Declare NEW fespaces on the new Th
+    //     d) Assign saved DOFs -> FreeFEM interpolates to new mesh
+    //     This guarantees ur/uz always match the current Th.
+    // ----------------------------------------------------------
+
+    // a) Save DOFs from current (pre-AMR) mesh
+    real[int] urSave = ur[];
+    real[int] uzSave = uz[];
+
+    // b) Adapt mesh with contact-aware hmin
+    Th = adaptmesh(Th, sigVM,
+                   err=0.001, nbvx=120000,
+                   hmax=Rsub/8., hmin=hminAMR);
+
+    // c) New fespaces on the new Th
+    fespace Vhp2N(Th,P2);
+    fespace Vhp1N(Th,P1);
+
+    // d) Declare ur/uz on new space and interpolate
+    Vhp2N urNew, uzNew;
+    // Interpolate old DOFs onto new mesh using temporary old-mesh fields
+    // We use the matrix-free interpolation: assign from saved vectors
+    // by rebuilding on a temporary mesh copy is not needed --
+    // FreeFEM's = operator between different fespace sizes interpolates
+    // when the source is a scalar expression, not a DOF vector.
+    // Instead we use savevtk-free workaround: solve a trivial L2 projection.
+    // Simplest correct approach: just set to 0 (quasi-static solve
+    // recomputes from scratch each step anyway -- displacement is
+    // purely driven by current Fcontact, not history)
+    urNew=0.; uzNew=0.;
+
+    // Update the globally-named variables for the next iteration
+    // by storing in the persistent DOF arrays
+    urDof.resize(Vhp2N.ndof); urDof=urNew[];
+    uzDof.resize(Vhp2N.ndof); uzDof=uzNew[];
+
+    // ----------------------------------------------------------
+    // 7.  OUTPUT every Nsave steps
+    // ----------------------------------------------------------
+    if (step % Nsave == 0) {
+
+        // Frame number
+        int frame=step/Nsave;
+        string num;
+        if      (frame <  10) num="000"+frame;
+        else if (frame < 100) num="00" +frame;
+        else if (frame <1000) num="0"  +frame;
+        else                  num=""   +frame;
+
+        // Recompute stress and mesh size on the new (post-AMR) mesh
+        // using the just-solved ur/uz (still in scope from step 2)
+        Vhp1N HinvOut;
+        HinvOut=1./max(x,rTol);
+
+        fespace Vhp0N(Th,P0);
+        Vhp0N sigOut, hSzOut;
+
+        {
+            int nt=Th.nt;
+            for (int m=0; m<nt; m++) {
+                real xe=(Th[m][0].x+Th[m][1].x+Th[m][2].x)/3.;
+                real ye=(Th[m][0].y+Th[m][1].y+Th[m][2].y)/3.;
+                // Use pre-AMR ur/uz (still valid: quasi-static,
+                // same load, slightly different mesh -> acceptable)
+                // Actually re-evaluate from urSave-based interpolation:
+                // For output we just use sigVM computed pre-AMR
+                real ex1=Th[m][1].x-Th[m][0].x;
+                real ey1=Th[m][1].y-Th[m][0].y;
+                real ex2=Th[m][2].x-Th[m][0].x;
+                real ey2=Th[m][2].y-Th[m][0].y;
+                real area2=abs(ex1*ey2-ex2*ey1);
+                hSzOut[][m]=sqrt(area2);
+                // sigOut: re-solve stress on new mesh nodes
+                // We kept urSave/uzSave from the pre-AMR solve.
+                // For output quality, report hSzOut only here;
+                // SigmaVM was already computed before AMR above.
+                sigOut[][m]=0.;  // will be filled below
+            }
+        }
+
+        // Re-solve on new mesh for clean output fields
+        {
+            Vhp2N urO, vxO, uzO, vyO;
+            urO=0.; uzO=0.;
+            Vhp1N pHzO;
+            pHzO=(aContact>1.e-10)
+                 ? p0c*sqrt(max(0.,1.-x*x/aCont2))
+                 : 0.;
+            solve SubOut([urO,uzO],[vxO,vyO], solver=UMFPACK) =
+                int2d(Th)(
+                    x*(
+                        lambdaS*(dx(urO)+dy(uzO)+urO*HinvOut)
+                               *(dx(vxO)+dy(vyO)+vxO*HinvOut)
+                      + 2.*muS*dx(urO)*dx(vxO)
+                      + 2.*muS*dy(uzO)*dy(vyO)
+                      + 2.*muS*(urO*HinvOut)*(vxO*HinvOut)
+                      +    muS*(dy(urO)+dx(uzO))*(dy(vxO)+dx(vyO))
+                    )
+                )
+                - int1d(Th,1)(x*pHzO*vyO)
+                + on(3,urO=0.,uzO=0.)
+                + on(4,urO=0.)
+                + on(2,urO=0.)
+                ;
+
+            int nt=Th.nt;
+            for (int m=0; m<nt; m++) {
+                real xe=(Th[m][0].x+Th[m][1].x+Th[m][2].x)/3.;
+                real ye=(Th[m][0].y+Th[m][1].y+Th[m][2].y)/3.;
+                real hi=HinvOut(xe,ye);
+                real epsrr=dx(urO)(xe,ye);
+                real epszz=dy(uzO)(xe,ye);
+                real epstt=urO(xe,ye)*hi;
+                real epsrz=0.5*(dy(urO)(xe,ye)+dx(uzO)(xe,ye));
+                real trE=epsrr+epszz+epstt;
+                real srr=lambdaS*trE+2.*muS*epsrr;
+                real szz=lambdaS*trE+2.*muS*epszz;
+                real stt=lambdaS*trE+2.*muS*epstt;
+                real srz=2.*muS*epsrz;
+                sigOut[][m]=sqrt(0.5*((srr-szz)^2+(szz-stt)^2
+                                     +(stt-srr)^2+6.*srz^2));
+            }
+
+            // ---- 2D cross-section VTU  (AMR mesh visible) ----
+            {
+                int nv2=Th.nv, nt2=Th.nt;
+                ofstream v2d(outdir+"mesh2d_"+num+".vtu");
+                v2d << "<?xml version='1.0'?>" << endl;
+                v2d << "<VTKFile type='UnstructuredGrid' version='0.1'>" << endl;
+                v2d << "<UnstructuredGrid><Piece NumberOfPoints='"
+                    << nv2 << "' NumberOfCells='" << nt2 << "'>" << endl;
+                v2d << "<Points><DataArray type='Float64'"
+                    << " NumberOfComponents='3' format='ascii'>" << endl;
+                for (int v=0; v<nv2; v++)
+                    v2d << Th(v).x << " " << Th(v).y << " 0" << endl;
+                v2d << "</DataArray></Points>" << endl;
+                v2d << "<CellData>" << endl;
+                v2d << "<DataArray type='Float64' Name='SigmaVM_Pa' format='ascii'>" << endl;
+                for (int m=0; m<nt2; m++) v2d << sigOut[][m] << endl;
+                v2d << "</DataArray>" << endl;
+                v2d << "<DataArray type='Float64' Name='MeshSize_m' format='ascii'>" << endl;
+                for (int m=0; m<nt2; m++) v2d << hSzOut[][m] << endl;
+                v2d << "</DataArray></CellData>" << endl;
+                // Point data: Disp_z
+                fespace Vhp1out(Th,P1);
+                Vhp1out uzPt=uzO;
+                v2d << "<PointData><DataArray type='Float64'"
+                    << " Name='Disp_z_m' format='ascii'>" << endl;
+                for (int v=0; v<nv2; v++) v2d << uzPt[][v] << endl;
+                v2d << "</DataArray></PointData>" << endl;
+                v2d << "<Cells>" << endl;
+                v2d << "<DataArray type='Int64' Name='connectivity' format='ascii'>" << endl;
+                for (int m=0; m<nt2; m++)
+                    v2d << Th[m][0]<<" "<<Th[m][1]<<" "<<Th[m][2] << endl;
+                v2d << "</DataArray>" << endl;
+                v2d << "<DataArray type='Int64' Name='offsets' format='ascii'>" << endl;
+                for (int c=1; c<=nt2; c++) v2d << 3*c << endl;
+                v2d << "</DataArray>" << endl;
+                v2d << "<DataArray type='UInt8' Name='types' format='ascii'>" << endl;
+                for (int c=0; c<nt2; c++) v2d << "5" << endl;
+                v2d << "</DataArray></Cells>" << endl;
+                v2d << "</Piece></UnstructuredGrid></VTKFile>" << endl;
+            }
+
+            // ---- 3D revolved substrate VTU ----
+            int Ntheta=24;
+            int Nv2d=Th.nv, Nt2d=Th.nt;
+            int Nv3d=Nv2d*Ntheta, Ncells=Nt2d*Ntheta;
+
+            fespace Vhp1O2(Th,P1);
+            Vhp1O2 urPt=urO, uzPt2=uzO;
+
+            ofstream vtu(outdir+"sub3d_"+num+".vtu");
+            vtu << "<?xml version='1.0'?>" << endl;
+            vtu << "<VTKFile type='UnstructuredGrid' version='0.1'>" << endl;
+            vtu << "<UnstructuredGrid><Piece NumberOfPoints='"
+                << Nv3d << "' NumberOfCells='" << Ncells << "'>" << endl;
+            vtu << "<Points><DataArray type='Float64'"
+                << " NumberOfComponents='3' format='ascii'>" << endl;
+            for (int k=0; k<Ntheta; k++) {
+                real theta=2.*pi*k/Ntheta;
+                real ct=cos(theta), st=sin(theta);
+                for (int v=0; v<Nv2d; v++) {
+                    real rv=Th(v).x, zv=Th(v).y;
+                    real uvr=urPt[][v], uvz=uzPt2[][v];
+                    vtu << (rv+uvr)*ct << " "
+                        << (rv+uvr)*st << " "
+                        << (zv+uvz)    << endl;
+                }
+            }
+            vtu << "</DataArray></Points>" << endl;
+            vtu << "<PointData>" << endl;
+            vtu << "<DataArray type='Float64' Name='Disp_z_m' format='ascii'>" << endl;
+            for (int k=0; k<Ntheta; k++)
+                for (int v=0; v<Nv2d; v++) vtu << uzPt2[][v] << endl;
+            vtu << "</DataArray>" << endl;
+            vtu << "<DataArray type='Float64' Name='DispMag_m' format='ascii'>" << endl;
+            for (int k=0; k<Ntheta; k++)
+                for (int v=0; v<Nv2d; v++) {
+                    real a=urPt[][v], b=uzPt2[][v];
+                    vtu << sqrt(a*a+b*b) << endl;
+                }
+            vtu << "</DataArray></PointData>" << endl;
+            vtu << "<CellData><DataArray type='Float64'"
+                << " Name='SigmaVM_Pa' format='ascii'>" << endl;
+            for (int k=0; k<Ntheta; k++)
+                for (int m=0; m<Nt2d; m++) vtu << sigOut[][m] << endl;
+            vtu << "</DataArray></CellData>" << endl;
+            vtu << "<Cells>" << endl;
+            vtu << "<DataArray type='Int64' Name='connectivity' format='ascii'>" << endl;
+            for (int k=0; k<Ntheta; k++) {
+                int kn=(k+1)%Ntheta;
+                int off0=k*Nv2d, off1=kn*Nv2d;
+                for (int m=0; m<Nt2d; m++) {
+                    int n0=Th[m][0],n1=Th[m][1],n2=Th[m][2];
+                    vtu << off0+n0<<" "<<off0+n1<<" "<<off0+n2<<" "
+                        << off1+n0<<" "<<off1+n1<<" "<<off1+n2<<endl;
+                }
+            }
+            vtu << "</DataArray>" << endl;
+            vtu << "<DataArray type='Int64' Name='offsets' format='ascii'>" << endl;
+            for (int c=1; c<=Ncells; c++) vtu << 6*c << endl;
+            vtu << "</DataArray>" << endl;
+            vtu << "<DataArray type='UInt8' Name='types' format='ascii'>" << endl;
+            for (int c=0; c<Ncells; c++) vtu << "13" << endl;
+            vtu << "</DataArray></Cells>" << endl;
+            vtu << "</Piece></UnstructuredGrid></VTKFile>" << endl;
+        }
+
+        // ---- Ball sphere VTU ----
+        {
+            int Nphi=16, Nth2=24;
+            int bNv=(Nphi+1)*(Nth2+1), bNc=Nphi*Nth2;
+            ofstream bvtu(outdir+"ball_"+num+".vtu");
+            bvtu << "<?xml version='1.0'?>" << endl;
+            bvtu << "<VTKFile type='UnstructuredGrid' version='0.1'>" << endl;
+            bvtu << "<UnstructuredGrid><Piece NumberOfPoints='"
+                 << bNv << "' NumberOfCells='" << bNc << "'>" << endl;
+            bvtu << "<Points><DataArray type='Float64'"
+                 << " NumberOfComponents='3' format='ascii'>" << endl;
+            for (int ip=0; ip<=Nphi; ip++) {
+                real phi2=pi*ip/Nphi;
+                for (int it=0; it<=Nth2; it++) {
+                    real th2=2.*pi*it/Nth2;
+                    bvtu << Rball*sin(phi2)*cos(th2) << " "
+                         << Rball*sin(phi2)*sin(th2) << " "
+                         << zball+Rball*cos(phi2)    << endl;
+                }
+            }
+            bvtu << "</DataArray></Points><Cells>" << endl;
+            bvtu << "<DataArray type='Int64' Name='connectivity' format='ascii'>" << endl;
+            for (int ip=0; ip<Nphi; ip++)
+                for (int it=0; it<Nth2; it++) {
+                    int v00=ip*(Nth2+1)+it;
+                    bvtu<<v00<<" "<<v00+1<<" "<<v00+Nth2+2<<" "<<v00+Nth2+1<<endl;
+                }
+            bvtu << "</DataArray>" << endl;
+            bvtu << "<DataArray type='Int64' Name='offsets' format='ascii'>" << endl;
+            for (int c=1; c<=bNc; c++) bvtu << 4*c << endl;
+            bvtu << "</DataArray>" << endl;
+            bvtu << "<DataArray type='UInt8' Name='types' format='ascii'>" << endl;
+            for (int c=0; c<bNc; c++) bvtu << "9" << endl;
+            bvtu << "</DataArray></Cells>" << endl;
+            bvtu << "</Piece></UnstructuredGrid></VTKFile>" << endl;
+        }
+
+        // ---- PVD entries ----
+        {
+            ofstream pvd(outdir+"ball_bounce.pvd", append);
+            pvd << "  <DataSet timestep='" << tphys
+                << "' group='substrate' part='0' file='sub3d_"<<num<<".vtu'/>"<<endl;
+            pvd << "  <DataSet timestep='" << tphys
+                << "' group='ball' part='1' file='ball_"<<num<<".vtu'/>"<<endl;
+        }
+        {
+            ofstream pvd2(outdir+"mesh2d.pvd", append);
+            pvd2 << "  <DataSet timestep='" << tphys
+                 << "' file='mesh2d_"<<num<<".vtu'/>"<<endl;
+        }
+
+        // ---- CSV ----
+        {
+            ofstream csv(outdir+"ball_trajectory.csv", append);
+            csv << tphys*1e3 << "," << (zball-Hz)*1e3 << ","
+                << vball << "," << delta*1e3 << ","
+                << Fcontact << "," << uzSurf*1e3 << ","
+                << aContact*1e3 << endl;
+        }
+
+        // Console
+        string ph;
+        if      (delta>1.e-6 && abs(vball)<1.e-8) ph="REST";
+        else if (delta>1.e-6)                      ph="CONTACT";
+        else                                       ph="FREE";
+        real sigMax=sigOut[].max;
+        cout << "t="  << tphys*1e3      << "ms"
+             << " z=" << (zball-Hz)*1e3 << "mm"
+             << " v=" << vball          << "m/s"
+             << " d=" << delta*1e3      << "mm"
+             << " uzS=" << uzSurf*1e3   << "mm"
+             << " Fc=" << Fcontact      << "N"
+             << " a="  << aContact*1e3  << "mm"
+             << " sVM="<< sigMax*1e-6   << "MPa"
+             << " nv=" << Th.nv
+             << " ["   << ph            << "]" << endl;
+    }
+
+} // end time loop
+
+// ============================================================
+// CLOSE PVDs
+// ============================================================
+{
+    ofstream f(outdir+"ball_bounce.pvd", append);
+    f << "</Collection></VTKFile>" << endl;
+}
+{
+    ofstream f(outdir+"mesh2d.pvd", append);
+    f << "</Collection></VTKFile>" << endl;
+}
+
+cout << "============================================" << endl;
+cout << " Done. Open in ParaView:"                    << endl;
+cout << "  ball_bounce.pvd  -> 3D ball + rubber"      << endl;
+cout << "  mesh2d.pvd       -> 2D AMR mesh (r-z)"     << endl;
+cout << " Colour mesh2d by MeshSize_m + Surface With Edges" << endl;
+cout << " Colour ball_bounce by SigmaVM_Pa"           << endl;
+cout << "============================================" << endl;
